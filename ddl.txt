@@ -1,0 +1,128 @@
+drop table if exists shipping_info;
+drop table if exists shipping_country_rates;
+drop table if exists shipping_agreement;
+drop table if exists shipping_transfer;
+
+
+create table shipping_country_rates
+(
+    shipping_country_id        serial primary key,
+    shipping_country           text,
+    shipping_country_base_rate numeric(14, 3)
+);
+
+insert into shipping_country_rates (shipping_country, shipping_country_base_rate)
+select distinct shipping_country, shipping_country_base_rate
+from shipping;
+
+select *
+from shipping_country_rates;
+
+create table shipping_agreement
+(
+    agreementid          bigint primary key,
+    agreement_number     text,
+    agreement_rate       numeric(14, 2),
+    agreement_commission numeric(14, 2)
+);
+
+insert into shipping_agreement
+select vad[1]::bigint         as agreementid,
+       vad[2]                 as agreement_number,
+       vad[3]::numeric(14, 2) as agreement_rate,
+       vad[4]::numeric(14, 2) as agreement_commission
+from (select distinct regexp_split_to_array(vendor_agreement_description, ':') as vad from shipping) tmp;
+
+
+create table shipping_transfer
+(
+    transfer_type_id       serial primary key,
+    transfer_type          text check ( transfer_type in ('1p', '3p') ),
+    transfer_model         text check ( transfer_model in ('ship', 'multiplie', 'train', 'airplane') ),
+    shipping_transfer_rate numeric(14, 3)
+);
+
+
+insert into shipping_transfer (transfer_type, transfer_model, shipping_transfer_rate)
+select std[1] as transfer_type,
+       std[2] as transfer_model,
+       shipping_transfer_rate
+from (select distinct regexp_split_to_array(shipping_transfer_description, ':') as std, shipping_transfer_rate
+      from shipping) as tmp;
+
+
+create table shipping_info
+(
+    shippingid             bigint primary key,
+    vendorid               bigint,
+    payment_amount         numeric(14, 2),
+    shipping_plan_datetime timestamp,
+    agreementid            bigint references shipping_agreement (agreementid) on update cascade,
+    shipping_country_id    bigint references shipping_country_rates (shipping_country_id) on update cascade,
+    transfer_type_id       bigint references shipping_transfer (transfer_type_id) on update cascade
+);
+
+truncate table shipping_info;
+
+insert into shipping_info
+select distinct shippingid,
+                vendorid,
+--                 transfer_type,
+--                 transfer_model,
+                payment_amount,
+                shipping_plan_datetime,
+                (regexp_split_to_array(vendor_agreement_description, ':'))[1]::bigint as agreementid,
+                shipping_country_id,
+                transfer_type_id
+from shipping s
+         join shipping_country_rates scr on s.shipping_country_base_rate = scr.shipping_country_base_rate
+         join shipping_transfer st
+              on (regexp_split_to_array(s.shipping_transfer_description, ':'))[1] = st.transfer_type
+                  and (regexp_split_to_array(s.shipping_transfer_description, ':'))[2] = st.transfer_model;
+-- order by shippingid, vendorid, transfer_type, transfer_model, payment_amount, shipping_plan_datetime, agreementid,
+--          shipping_country_id, transfer_type_id
+-- limit 10;
+
+
+create table shipping_status
+(
+    shippingid                   bigint,
+    status                       text,
+    state                        text,
+    shipping_start_fact_datetime timestamp,
+    shipping_end_fact_datetime   timestamp
+);
+
+explain analyse
+with tmp as (select distinct shippingid,
+                             status,
+                             state,
+                             lag(state_datetime)
+                             over (partition by shippingid order by state_datetime) as shipping_start_fact_datetime,
+                             state_datetime                                         as shipping_end_fact_datetime
+             from shipping
+             where state in ('booked', 'recieved')
+             order by shippingid, state_datetime)
+select count(*)
+from tmp
+where status = 'finished';
+
+select count(distinct shippingid    )
+from shipping;
+
+explain analyse
+with ship_max as (select shippingid,
+                         max(case when state = 'booked' then state_datetime else null end)   as shipping_start_fact_datetime,
+                         max(case when state = 'recieved' then state_datetime else null end) as shipping_end_fact_datetime,
+                         max(state_datetime)                                                 as max_state_datetime
+                  from shipping
+                  group by shippingid)
+select sm.shippingid
+     , s.status
+     , s.state
+     , sm.shipping_start_fact_datetime
+     , sm.shipping_end_fact_datetime
+from ship_max as sm
+         left join shipping as s on sm.shippingid = s.shippingid
+    and sm.max_state_datetime = s.state_datetime
+order by shippingid;
