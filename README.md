@@ -210,13 +210,22 @@ from shipping s
 ```postgresql
 create table shipping_status
 (
-    shippingid                   bigint primary key,
+    shippingid                   bigint,
     status                       text,
     state                        text,
     shipping_start_fact_datetime timestamp,
     shipping_end_fact_datetime   timestamp
 );
+```
 
+Честно задание как-то неправильно сформулировано.
+Например: `shipping_start_fact_datetime` — это время `state_datetime`,
+когда state заказа перешёл в состояние booked. `shipping_end_fact_datetime` —
+это время `state_datetime`, когда state заказа перешёл в состояние received.
+
+Текущий код можно было считать правильным
+
+```postgresql
 with tmp as (select distinct shippingid,
                              status,
                              state,
@@ -231,3 +240,145 @@ from tmp
 where status = 'finished';
 ```
 
+Но не учтено, что в выборку должно попасть заказы которые еще не `finished`.
+Поговорив с наставниками пришли к выводу, что если заказ еще не `recieved/returned`
+то оставим поле `shipping_end_fact_datetime` как `null` так как
+в выборку должны попасть все `shippingid`.
+
+Мы узнали макс старт и энд дейты для всех shippingid.
+И при джойне с исходной таблицей в выборку входят все `state`. Но мы не
+знаем на каком этапе остановилась `state` которые еще `in_progres`.
+
+С помощью подсказки `Данные в таблице должны отражать
+максимальный status и state по максимальному времени
+лога state_datetime в таблице shipping` мы можем убрать дубликаты
+так как ме не знаем на каком `state` этапе остановились in_progress заказы.
+Исходя из этого выводы можно сделать
+что все заказы имеют хотя бы один state_datetime
+`booked` и `max_date` для него будет `booked` `state_time`
+
+Тут лучше сделать просто inner join, мы уже проверили что в нем нет
+null колонок. => `shipping_start_fact_datetime` и `max_date`
+всегда со значениями
+
+```postgresql
+with tmp as (select shippingid,
+                    max(case when state = 'booked' then state_datetime end)   as shipping_start_fact_datetime,
+                    max(case when state = 'recieved' then state_datetime end) as shipping_end_fact_datetime,
+                    max(state_datetime)                                       as max_date
+             from shipping
+             group by shippingid)
+select tmp.shippingid, status, state, state_datetime
+from tmp
+         join shipping s on tmp.shippingid = s.shippingid
+where max_date = s.state_datetime
+order by shippingid, state_datetime
+```
+
+| shippingid | status | state | shipping\_start\_fact\_datetime | shipping\_end\_fact\_datetime |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | finished | recieved | 2021-09-05 06:42:34.249000 | 2021-09-15 04:26:57.690965 |
+| 2 | finished | recieved | 2021-12-06 22:27:48.306000 | 2021-12-11 21:00:44.409529 |
+| 3 | finished | recieved | 2021-10-26 10:33:16.659000 | 2021-10-27 04:03:32.884517 |
+| 4 | finished | recieved | 2021-09-13 16:21:32.421000 | 2021-09-19 13:00:30.088309 |
+| 5 | finished | recieved | 2021-12-29 14:47:46.141000 | 2022-01-09 20:21:08.963093 |
+| 6 | finished | recieved | 2021-10-31 07:05:50.404000 | 2021-11-01 02:21:46.579824 |
+| 7 | finished | recieved | 2021-10-06 23:27:52.573000 | 2021-10-07 17:11:07.012931 |
+| 8 | finished | returned | 2021-09-02 02:42:48.067000 | 2021-09-03 11:27:42.602866 |
+| 9 | finished | recieved | 2021-09-08 04:47:59.753000 | 2021-09-09 14:50:14.936743 |
+| 10 | finished | recieved | 2021-12-18 09:41:19.969000 | 2021-12-28 00:55:32.210965 |
+
+# 6.
+
+```postgresql
+create table shipping_datamart
+(
+    shippingid            bigint,
+    vendorid              bigint,
+    transfer_type         text,
+    full_day_at_shipping  bigint,
+    is_delay              bigint,
+    is_shipping_finish    bigint,
+    delay_day_at_shipping bigint,
+    payment_amount numeric(14, 3),
+    vat                   numeric(14, 3),
+    profit                numeric(14, 2)
+);
+
+insert into shipping_datamart
+with data_mart as (select s.shippingid,
+                          s.vendorid,
+                          (regexp_split_to_array(shipping_transfer_description, ':'))[1]                 as transfer_type,
+                          date_part('day',
+                                    age(ss.shipping_end_fact_datetime, ss.shipping_start_fact_datetime)) as full_day_at_shipping,
+                          case
+                              when shipping_end_fact_datetime > s.shipping_plan_datetime then 1
+                              else 0 end                                                                 as is_delay,
+                          case when s.status = 'finished' then 1 else 0 end                              as is_shipping_finish,
+                          case
+                              when ss.shipping_end_fact_datetime > shipping_plan_datetime
+                                  then extract(days from (shipping_end_fact_datetime - shipping_plan_datetime))
+                              else 0 end                                                                 as delay_day_at_shipping,
+                          s.payment_amount,
+                          payment_amount *
+                          (shipping_country_base_rate +
+                           (regexp_split_to_array(vendor_agreement_description, ':'))[3]::numeric(14, 3) +
+                           shipping_transfer_rate)                                                       as vat,
+                          payment_amount *
+                          (regexp_split_to_array(vendor_agreement_description, ':'))[4]::numeric(14, 2)  as profit,
+                          state_datetime
+                   from shipping s
+                            join public.shipping_status ss on s.shippingid = ss.shippingid
+                   order by shippingid, is_shipping_finish),
+
+     max_dates as (select shippingid, max(state_datetime) as max_state_datetime
+                   from shipping
+                   group by shippingid)
+select dm.shippingid,
+       vendorid,
+       transfer_type,
+       full_day_at_shipping,
+       is_delay,
+       is_shipping_finish,
+       delay_day_at_shipping,
+       payment_amount,
+       vat,
+       profit
+from max_dates
+         join data_mart dm on dm.shippingid = max_dates.shippingid
+where max_state_datetime = dm.state_datetime
+order by shippingid;
+```
+
+
+
+Про внешние ключи ничего не сказано так что получал некоторые поля прямо на ходу.
+Джоинил только с shipping_status. Тут distinct не поможет, так как по мере изменения
+`state` некоторые поля тож меняются я решил что лучше оставить последнюю запись
+Иначе он будет похоже на нечто такое.
+И еще нужно приводить результаты типов к numeric(14, 3) если одна
+из слагаемых numeric(14, 2)
+
+| shippingid | vendorid | transfer\_type | full\_day\_at\_shipping | is\_delay | is\_shipping\_finish | delay\_day\_at\_shipping | payment\_amount | vat | profit | state\_datetime |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | 1 | 1p | 9 | 0 | 0 | 0 | 6.06 | 1.1817 | 0.1212 | 2021-09-05 06:42:34.249000 |
+| 1 | 1 | 1p | 9 | 0 | 0 | 0 | 6.06 | 1.1817 | 0.1212 | 2021-09-06 00:30:10.811329 |
+| 1 | 1 | 1p | 9 | 0 | 0 | 0 | 6.06 | 1.1817 | 0.1212 | 2021-09-06 15:28:09.690965 |
+| 1 | 1 | 1p | 9 | 0 | 0 | 0 | 6.06 | 1.1817 | 0.1212 | 2021-09-06 07:54:40.258576 |
+| 1 | 1 | 1p | 9 | 0 | 0 | 0 | 6.06 | 1.1817 | 0.1212 | 2021-09-14 04:30:33.690965 |
+| 1 | 1 | 1p | 9 | 0 | 1 | 0 | 6.06 | 1.1817 | 0.1212 | 2021-09-15 04:26:57.690965 |
+
+И тут без дубликатов
+
+| shippingid | vendorid | transfer\_type | full\_day\_at\_shipping | is\_delay | is\_shipping\_finish | delay\_day\_at\_shipping |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | 1 | 1p | 9 | 0 | 1 | 0 |
+| 2 | 1 | 1p | 4 | 0 | 1 | 0 |
+| 3 | 1 | 1p | 0 | 0 | 1 | 0 |
+| 4 | 3 | 1p | 5 | 0 | 1 | 0 |
+| 5 | 3 | 1p | 11 | 1 | 1 | 6 |
+| 6 | 1 | 1p | 0 | 0 | 1 | 0 |
+| 7 | 1 | 3p | 0 | 0 | 1 | 0 |
+| 8 | 1 | 1p | 1 | 0 | 1 | 0 |
+| 9 | 1 | 1p | 1 | 0 | 1 | 0 |
+| 10 | 1 | 1p | 9 | 0 | 1 | 0 |
