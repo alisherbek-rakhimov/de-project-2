@@ -313,7 +313,7 @@ select s.shippingid,
        s.vendorid,
        (regexp_split_to_array(shipping_transfer_description, ':'))[1]                 as transfer_type,
        date_part('day',
-                 age(ss.shipping_end_fact_datetime, ss.shipping_start_fact_datetime)) as full_day_at_shipping,
+                 ss.shipping_end_fact_datetime - ss.shipping_start_fact_datetime) as full_day_at_shipping,
        case
            when shipping_end_fact_datetime > s.shipping_plan_datetime then 1
            else 0 end                                                                 as is_delay,
