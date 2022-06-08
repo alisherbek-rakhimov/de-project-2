@@ -13,7 +13,7 @@
 ```postgresql
 create table shipping_country_rates
 (
-    shipping_countr_id         serial primary key,
+    shipping_country_id        serial primary key,
     shipping_country           text,
     shipping_country_base_rate numeric(14, 3)
 );
@@ -262,6 +262,7 @@ null колонок. => `shipping_start_fact_datetime` и `max_date`
 всегда со значениями
 
 ```postgresql
+insert into shipping_status
 with tmp as (select shippingid,
                     max(case when state = 'booked' then state_datetime end)   as shipping_start_fact_datetime,
                     max(case when state = 'recieved' then state_datetime end) as shipping_end_fact_datetime,
@@ -290,6 +291,8 @@ order by shippingid, state_datetime
 
 # 6.
 
+### Упростил код, убрал лишний джоин, убрал дубликаты оставляя только записи со свежим status/state из shipping_info
+
 ```postgresql
 create table shipping_datamart
 (
@@ -300,57 +303,37 @@ create table shipping_datamart
     is_delay              bigint,
     is_shipping_finish    bigint,
     delay_day_at_shipping bigint,
-    payment_amount numeric(14, 3),
+    payment_amount        numeric(14, 3),
     vat                   numeric(14, 3),
     profit                numeric(14, 2)
 );
 
 insert into shipping_datamart
-with data_mart as (select s.shippingid,
-                          s.vendorid,
-                          (regexp_split_to_array(shipping_transfer_description, ':'))[1]                 as transfer_type,
-                          date_part('day',
-                                    age(ss.shipping_end_fact_datetime, ss.shipping_start_fact_datetime)) as full_day_at_shipping,
-                          case
-                              when shipping_end_fact_datetime > s.shipping_plan_datetime then 1
-                              else 0 end                                                                 as is_delay,
-                          case when s.status = 'finished' then 1 else 0 end                              as is_shipping_finish,
-                          case
-                              when ss.shipping_end_fact_datetime > shipping_plan_datetime
-                                  then extract(days from (shipping_end_fact_datetime - shipping_plan_datetime))
-                              else 0 end                                                                 as delay_day_at_shipping,
-                          s.payment_amount,
-                          payment_amount *
-                          (shipping_country_base_rate +
-                           (regexp_split_to_array(vendor_agreement_description, ':'))[3]::numeric(14, 3) +
-                           shipping_transfer_rate)                                                       as vat,
-                          payment_amount *
-                          (regexp_split_to_array(vendor_agreement_description, ':'))[4]::numeric(14, 2)  as profit,
-                          state_datetime
-                   from shipping s
-                            join public.shipping_status ss on s.shippingid = ss.shippingid
-                   order by shippingid, is_shipping_finish),
-
-     max_dates as (select shippingid, max(state_datetime) as max_state_datetime
-                   from shipping
-                   group by shippingid)
-select dm.shippingid,
-       vendorid,
-       transfer_type,
-       full_day_at_shipping,
-       is_delay,
-       is_shipping_finish,
-       delay_day_at_shipping,
-       payment_amount,
-       vat,
-       profit
-from max_dates
-         join data_mart dm on dm.shippingid = max_dates.shippingid
-where max_state_datetime = dm.state_datetime
-order by shippingid;
+select s.shippingid,
+       s.vendorid,
+       (regexp_split_to_array(shipping_transfer_description, ':'))[1]                 as transfer_type,
+       date_part('day',
+                 age(ss.shipping_end_fact_datetime, ss.shipping_start_fact_datetime)) as full_day_at_shipping,
+       case
+           when shipping_end_fact_datetime > s.shipping_plan_datetime then 1
+           else 0 end                                                                 as is_delay,
+       case when s.status = 'finished' then 1 else 0 end                              as is_shipping_finish,
+       case
+           when ss.shipping_end_fact_datetime > shipping_plan_datetime
+               then extract(days from (shipping_end_fact_datetime - shipping_plan_datetime))
+           else 0 end                                                                 as delay_day_at_shipping,
+       s.payment_amount,
+       payment_amount *
+       (shipping_country_base_rate +
+        (regexp_split_to_array(vendor_agreement_description, ':'))[3]::numeric(14, 3) +
+        shipping_transfer_rate)                                                       as vat,
+       payment_amount *
+       (regexp_split_to_array(vendor_agreement_description, ':'))[4]::numeric(14, 2)  as profit
+from shipping s
+         join public.shipping_status ss on s.shippingid = ss.shippingid
+    and s.state = ss.state and s.status = ss.status
+order by shippingid, is_shipping_finish;
 ```
-
-
 
 Про внешние ключи ничего не сказано так что получал некоторые поля прямо на ходу.
 Джоинил только с shipping_status. Тут distinct не поможет, так как по мере изменения
